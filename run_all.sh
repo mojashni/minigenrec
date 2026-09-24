@@ -9,7 +9,11 @@ SEEDS=(0 1 2)
 run() {
   local name="$1"; shift
   local out="results/$name/metrics.json"
-  if [[ -f "$out" ]]; then
+  if [[ -f "$out" \
+     && -f "results/$name/per_user_warm_test_full.csv" \
+     && -f "results/$name/per_user_warm_test_warm_only.csv" \
+     && -f "results/$name/per_user_cold_test.csv" \
+     && -f "results/$name/per_user_cold_test_cold_only.csv" ]]; then
     echo "skip $name"
     return 0
   fi
@@ -28,7 +32,9 @@ done
 
 "$PY" report.py --n-train "$N" > results/summary.md
 cat results/summary.md
+"$PY" report.py --a "genrec_hybrid_n${N}" --b "sasrec_hybrid_n${N}" > results/primary_comparison.json
+cat results/primary_comparison.json
 
 mkdir -p results/bundle
-tar -czf "results/bundle/main_table_$(date +%Y%m%d_%H%M).tar.gz" results/summary.md results/*_n${N}_seed*/metrics.json results/*_n${N}_seed*/per_user_*.csv results/data_stats.json results/model_revision.json results/choose_k.json 2>/dev/null || true
+tar -czf "results/bundle/main_table_$(date +%Y%m%d_%H%M).tar.gz" results/summary.md results/primary_comparison.json results/*_n${N}_seed*/metrics.json results/*_n${N}_seed*/per_user_*.csv results/data_stats.json results/model_revision.json results/choose_k.json 2>/dev/null || true
 echo "done"

@@ -55,11 +55,51 @@ def summary_markdown(df: pd.DataFrame) -> str:
     return "\n".join(lines) + "\n"
 
 
+def averaged_user_metric(
+    results_dir: Path,
+    selector: str,
+    segment: str,
+    metric: str,
+) -> tuple[pd.Series, list[str]]:
+    """Load one run, or average matching ``<selector>_seed*`` runs per user."""
+    exact = results_dir / selector / f"per_user_{segment}.csv"
+    if exact.exists():
+        paths = [exact]
+    else:
+        paths = [
+            path
+            for path in sorted(results_dir.glob(f"{selector}_seed*/per_user_{segment}.csv"))
+            if re.fullmatch(rf"{re.escape(selector)}_seed\d+", path.parent.name)
+        ]
+    if not paths:
+        raise FileNotFoundError(
+            f"no per-user files for {selector!r}, segment {segment!r} in {results_dir}"
+        )
+
+    series = []
+    for path in paths:
+        frame = pd.read_csv(path)
+        if "user_id" not in frame or metric not in frame:
+            raise ValueError(f"{path} must contain user_id and {metric}")
+        if frame["user_id"].duplicated().any():
+            raise ValueError(f"duplicate user_id in {path}")
+        series.append(frame.set_index("user_id")[metric].sort_index().rename(path.parent.name))
+
+    expected = series[0].index
+    for values in series[1:]:
+        if not values.index.equals(expected):
+            raise ValueError(f"seed user sets differ for {selector!r}")
+    return pd.concat(series, axis=1).mean(axis=1), [path.parent.name for path in paths]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-train", type=int, default=100_000)
-    parser.add_argument("--a", help="run dir A for a paired bootstrap (e.g. genrec_hybrid_n100000_seed0)")
-    parser.add_argument("--b", help="run dir B")
+    parser.add_argument(
+        "--a",
+        help="run dir or pre-seed prefix A (e.g. genrec_hybrid_n100000)",
+    )
+    parser.add_argument("--b", help="run dir or pre-seed prefix B")
     parser.add_argument("--segment", default="cold_test")
     parser.add_argument("--metric", default="hit", choices=["hit", "ndcg", "mrr"])
     args = parser.parse_args()
@@ -67,10 +107,25 @@ def main() -> None:
     if not (args.a and args.b):
         print(summary_markdown(seed_table(RESULTS_DIR, args.n_train)), end="")
         return
-    a = pd.read_csv(RESULTS_DIR / args.a / f"per_user_{args.segment}.csv").set_index("user_id")[args.metric]
-    b = pd.read_csv(RESULTS_DIR / args.b / f"per_user_{args.segment}.csv").set_index("user_id")[args.metric]
+    a, runs_a = averaged_user_metric(RESULTS_DIR, args.a, args.segment, args.metric)
+    b, runs_b = averaged_user_metric(RESULTS_DIR, args.b, args.segment, args.metric)
     delta, lo, hi = paired_bootstrap(a, b, BOOTSTRAP_SAMPLES, BOOTSTRAP_SEED)
-    print(json.dumps({"segment": args.segment, "metric": args.metric, "delta": delta, "lo": lo, "hi": hi}, indent=2))
+    print(
+        json.dumps(
+            {
+                "a": args.a,
+                "b": args.b,
+                "runs_a": runs_a,
+                "runs_b": runs_b,
+                "segment": args.segment,
+                "metric": args.metric,
+                "delta": delta,
+                "lo": lo,
+                "hi": hi,
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

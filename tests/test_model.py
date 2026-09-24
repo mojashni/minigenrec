@@ -98,6 +98,16 @@ def test_evaluate_cold_only_and_cold_intrusion():
     assert float(full["cold_topk"][0]) == 0.5  # top-2 = {2, 0}
 
 
+def test_cold_intrusion_splits_boundary_ties_proportionally():
+    from minigenrec.evaluation import cold_topk_share
+
+    scores = np.zeros((1, 4), dtype=np.float64)
+    mask = np.zeros((1, 4), dtype=bool)
+    cold = np.array([False, False, True, True])
+
+    assert float(cold_topk_share(scores, mask, cold, k=2)[0]) == 0.5
+
+
 def test_scores_finite_and_target_unmasked_path():
     n, d = 10, 8
     enc = ItemEncoder(n, d, mode="id")
@@ -275,6 +285,32 @@ def test_report_aggregates_seeds(tmp_path):
     assert "| sasrec_id | 2 |" in md
     assert "0.1500 ± 0.0707" in md
     assert "—" in md  # old runs have no cold-only segment
+
+
+def test_report_averages_users_across_seeds_before_pairing(tmp_path):
+    from report import averaged_user_metric
+
+    for model, values_by_seed in {
+        "genrec": ([0.0, 1.0], [1.0, 1.0]),
+        "sasrec": ([0.0, 0.0], [0.0, 1.0]),
+    }.items():
+        for seed, values in enumerate(values_by_seed):
+            run = tmp_path / f"{model}_hybrid_n100_seed{seed}"
+            run.mkdir()
+            pd.DataFrame({"user_id": [10, 20], "hit": values}).to_csv(
+                run / "per_user_cold_test.csv", index=False
+            )
+
+    genrec, genrec_runs = averaged_user_metric(
+        tmp_path, "genrec_hybrid_n100", "cold_test", "hit"
+    )
+    sasrec, sasrec_runs = averaged_user_metric(
+        tmp_path, "sasrec_hybrid_n100", "cold_test", "hit"
+    )
+
+    assert genrec.to_dict() == {10: 0.5, 20: 1.0}
+    assert sasrec.to_dict() == {10: 0.0, 20: 0.5}
+    assert len(genrec_runs) == len(sasrec_runs) == 2
 
 
 def test_text_embedding_cache_key_fingerprints_content_and_order():

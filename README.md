@@ -47,8 +47,11 @@ Main table (skip finished runs; writes `results/summary.md` with mean ± std ove
 ```bash
 bash run_all.sh
 .venv/bin/python report.py                      # seed summary
-.venv/bin/python report.py --a genrec_hybrid_n100000_seed0 --b sasrec_hybrid_n100000_seed0
+.venv/bin/python report.py --a genrec_hybrid_n100000 --b sasrec_hybrid_n100000
 ```
+
+For the prefix form above, per-user metrics are averaged across all matching seeds before
+the paired bootstrap. Exact run names ending in `_seed0`, etc. still compare a single seed.
 
 ## Protocol (short)
 

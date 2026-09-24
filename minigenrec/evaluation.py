@@ -10,6 +10,36 @@ from minigenrec.data import Dataset, candidate_mask
 from minigenrec.metrics import metrics_from_ranks, ranks
 
 
+def cold_topk_share(
+    scores: np.ndarray,
+    mask: np.ndarray,
+    cold_mask: np.ndarray,
+    k: int = TOP_K,
+) -> np.ndarray:
+    """Expected cold share in top-k, splitting boundary ties proportionally."""
+    if k <= 0:
+        raise ValueError("k must be positive")
+    shares = np.empty(len(scores), dtype=np.float64)
+    for i in range(len(scores)):
+        valid = ~mask[i]
+        n_take = min(k, int(valid.sum()))
+        if n_take == 0:
+            shares[i] = np.nan
+            continue
+        valid_scores = scores[i, valid]
+        valid_cold = cold_mask[valid]
+        threshold = np.partition(valid_scores, len(valid_scores) - n_take)[
+            len(valid_scores) - n_take
+        ]
+        above = valid_scores > threshold
+        tied = valid_scores == threshold
+        remaining = n_take - int(above.sum())
+        expected_cold = float(valid_cold[above].sum())
+        expected_cold += remaining * float(valid_cold[tied].mean())
+        shares[i] = expected_cold / n_take
+    return shares
+
+
 def mean_hit(dataset: Dataset, split_df: pd.DataFrame, score_fn, batch_size: int) -> float:
     """Checkpoint-selection metric: warm-only Hit@K, so cold items never influence selection."""
     frame = evaluate(dataset, split_df, score_fn, batch_size, warm_only=True)
@@ -50,8 +80,7 @@ def evaluate(
         targets = batch["target_full"].to_numpy()
         rank = ranks(scores, targets, mask)
         hit, ndcg, mrr = metrics_from_ranks(rank)
-        masked = np.where(mask, -np.inf, scores.astype(np.float64))
-        top = np.argpartition(-masked, TOP_K - 1, axis=1)[:, :TOP_K]
+        cold_topk = cold_topk_share(scores.astype(np.float64), mask, dataset.cold_mask)
         parts.append(
             pd.DataFrame(
                 {
@@ -62,7 +91,7 @@ def evaluate(
                     "ndcg": ndcg,
                     "mrr": mrr,
                     "bucket": dataset.pop_buckets[targets],
-                    "cold_topk": dataset.cold_mask[top].mean(axis=1),
+                    "cold_topk": cold_topk,
                 }
             )
         )

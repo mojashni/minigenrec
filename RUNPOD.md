@@ -23,7 +23,7 @@ python - <<'PY'
 from minigenrec.data import prepare
 from minigenrec.text_emb import load_text_emb
 ds = prepare()
-emb = load_text_emb(ds, "real", device="cuda")
+emb = load_text_emb(ds, "real")
 print(emb.shape)
 PY
 
