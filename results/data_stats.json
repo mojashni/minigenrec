@@ -1,0 +1,24 @@
+{
+  "n_users_kept": 6035,
+  "n_items": 3706,
+  "n_warm": 3336,
+  "n_cold": 370,
+  "cold_ratio": 0.1,
+  "attempts": [
+    {
+      "ratio": 0.1,
+      "n_users": 1657,
+      "n_interactions": 2013
+    }
+  ],
+  "n_train": 504966,
+  "n_val": 6035,
+  "n_test": 6035,
+  "n_cold_test": 2013,
+  "cold_test_users": 1657,
+  "cold_test_by_bucket": {
+    "head": 1425,
+    "mid": 511,
+    "tail": 77
+  }
+}

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+data/
+cache/
+*.pkl
+*.pt
+.pytest_cache/
+results/**/per_user_*.csv
+results/**/*.log
+results/bundle/
+*.tgz
+.DS_Store
