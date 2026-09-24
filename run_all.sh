@@ -26,6 +26,9 @@ for s in "${SEEDS[@]}"; do
   run "genrec_hybrid_n${N}_seed${s}" --model genrec --items hybrid --titles real --n-train "$N" --model-seed "$s"
 done
 
+"$PY" report.py --n-train "$N" > results/summary.md
+cat results/summary.md
+
 mkdir -p results/bundle
-tar -czf "results/bundle/main_table_$(date +%Y%m%d_%H%M).tar.gz" results/*_n${N}_seed*/metrics.json results/*_n${N}_seed*/per_user_*.csv results/data_stats.json results/model_revision.json results/choose_k.json 2>/dev/null || true
+tar -czf "results/bundle/main_table_$(date +%Y%m%d_%H%M).tar.gz" results/summary.md results/*_n${N}_seed*/metrics.json results/*_n${N}_seed*/per_user_*.csv results/data_stats.json results/model_revision.json results/choose_k.json 2>/dev/null || true
 echo "done"

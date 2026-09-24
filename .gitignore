@@ -10,3 +10,6 @@ results/**/*.log
 results/bundle/
 *.tgz
 .DS_Store
+results/archive_oldcode/
+results/from_runpod*/
+.cursor/

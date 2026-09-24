@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from minigenrec.config import ID_DROPOUT
+
 
 def softplus_inv(y: float) -> float:
     # raw so softplus(raw) == y
@@ -25,12 +27,14 @@ class ItemEncoder(nn.Module):
         text_dim: int | None = None,
         cold_mask: torch.Tensor | None = None,
         init_lambda: float = 0.1,
+        id_dropout: float = ID_DROPOUT,
     ):
         super().__init__()
         if mode not in ("id", "text", "hybrid"):
             raise ValueError(mode)
         self.mode = mode
         self.dim = dim
+        self.id_dropout = id_dropout
         self.id_emb = nn.Embedding(n_items, dim)
         nn.init.normal_(self.id_emb.weight, std=0.02)
         self.register_buffer(
@@ -61,6 +65,8 @@ class ItemEncoder(nn.Module):
         assert self.raw_lambda is not None
         lam = F.softplus(self.raw_lambda)
         m = (~self.cold_mask).to(dtype=text_part.dtype).unsqueeze(-1)
+        if self.training and self.id_dropout > 0:
+            m = m * (torch.rand_like(m) >= self.id_dropout).to(m.dtype)
         return F.normalize(text_part + lam * m * id_part, dim=-1, eps=1e-6)
 
     def encode_ids(self, item_ids: torch.Tensor, catalog: torch.Tensor) -> torch.Tensor:
@@ -77,5 +83,6 @@ class ScoreHead(nn.Module):
     def forward(self, h: torch.Tensor, item_emb: torch.Tensor) -> torch.Tensor:
         u = F.normalize(self.w_user(h), dim=-1, eps=1e-6)
         scale = self.log_scale.clamp(max=math.log(100.0)).exp()
-        scores = scale * (u @ item_emb.T)
-        return torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        # Do not sanitize numerical failures into plausible-looking zero scores.
+        # Evaluation rejects non-finite scores and the loss guard fails training fast.
+        return scale * (u @ item_emb.T)

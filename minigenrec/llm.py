@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 
 from minigenrec.config import MAX_LEN, MODEL_ID, MODEL_REVISION
 from minigenrec.model import ItemEncoder, ScoreHead
@@ -14,11 +14,17 @@ from minigenrec.verbalize import MARKER, text_cache_path
 
 
 def load_tokenizer(model_id: str = MODEL_ID, revision: str | None = MODEL_REVISION):
-    return AutoTokenizer.from_pretrained(model_id, revision=revision, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, trust_remote_code=True)
+    # Pooling uses attention_mask.sum() - 1, which assumes right padding.
+    tokenizer.padding_side = "right"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 
 
 def load_backbone(model_id: str = MODEL_ID, revision: str | None = MODEL_REVISION, freeze: bool = True):
-    model = AutoModelForCausalLM.from_pretrained(
+    # AutoModel (no lm_head) — much lower eval VRAM than CausalLM
+    model = AutoModel.from_pretrained(
         model_id,
         revision=revision,
         torch_dtype=torch.float16,
@@ -39,7 +45,7 @@ def apply_lora(backbone, r: int = 8, alpha: int = 16):
         target_modules=["q_proj", "v_proj"],
         lora_dropout=0.05,
         bias="none",
-        task_type="CAUSAL_LM",
+        task_type="FEATURE_EXTRACTION",
     )
     return get_peft_model(backbone, cfg)
 
@@ -62,13 +68,13 @@ class LLMUserEncoder(nn.Module):
         out = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
             use_cache=False,
         )
-        hidden = out.hidden_states[-1]
+        hidden = out.last_hidden_state
         # pool at last non-pad token (= marker end when prompts are built correctly)
         lengths = attention_mask.sum(dim=1).clamp(min=1) - 1
-        return hidden[torch.arange(hidden.size(0), device=hidden.device), lengths]
+        # ScoreHead / ItemEncoder are float32; backbone is fp16
+        return hidden[torch.arange(hidden.size(0), device=hidden.device), lengths].float()
 
 
 class LLMRanker(nn.Module):
@@ -110,8 +116,8 @@ def encode_movie_texts(
             max_length=64,
         )
         enc = {k: v.to(device) for k, v in enc.items()}
-        out = backbone(**enc, output_hidden_states=True, use_cache=False)
-        hidden = out.hidden_states[-1]
+        out = backbone(**enc, use_cache=False)
+        hidden = out.last_hidden_state
         mask = enc["attention_mask"]
         lengths = mask.sum(dim=1).clamp(min=1) - 1
         pooled = hidden[torch.arange(hidden.size(0), device=device), lengths]
@@ -124,15 +130,18 @@ def build_or_load_text_cache(
     title_mode: str,
     model_id: str = MODEL_ID,
     revision: str | None = MODEL_REVISION,
-    device: str = "cpu",
 ) -> torch.Tensor:
-    path = text_cache_path(model_id, revision, title_mode)
+    path = text_cache_path(model_id, revision, title_mode, movies_in_catalog_order)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        return torch.load(path, map_location="cpu", weights_only=True)
+        cached = torch.load(path, map_location="cpu", weights_only=True)
+        if cached.ndim != 2 or cached.shape[0] != len(movies_in_catalog_order):
+            raise ValueError(f"invalid text embedding cache shape at {path}: {tuple(cached.shape)}")
+        return cached
     tokenizer = load_tokenizer(model_id, revision)
-    backbone = load_backbone(model_id, revision, freeze=True)
-    emb = encode_movie_texts(backbone, tokenizer, movies_in_catalog_order, device=device)
+    # Always CPU fp32 so Mac and pod builds agree numerically; ship data/cache/ with the code.
+    backbone = load_backbone(model_id, revision, freeze=True).float()
+    emb = encode_movie_texts(backbone, tokenizer, movies_in_catalog_order, device="cpu")
     torch.save(emb, path)
     del backbone
     return emb

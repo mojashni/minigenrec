@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import pickle
 import re
 import shutil
@@ -36,6 +37,41 @@ _SPLIT_COLUMNS = [
     "target_pos",
     "hist_end",
 ]
+DATASET_CACHE_VERSION = 2
+
+
+def dataset_cache_fingerprint() -> str:
+    """Fingerprint every setting that changes the split or catalog mappings."""
+    payload = {
+        "version": DATASET_CACHE_VERSION,
+        "positive_min_rating": POSITIVE_MIN_RATING,
+        "cold_split_seed": COLD_SPLIT_SEED,
+        "cold_ratio_default": COLD_RATIO_DEFAULT,
+        "cold_ratio_fallback": COLD_RATIO_FALLBACK,
+        "cold_min_users": COLD_MIN_USERS,
+        "cold_min_interactions": COLD_MIN_INTERACTIONS,
+        "source": ML1M_URL,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _load_dataset_cache(path, fingerprint: str) -> Dataset | None:
+    with path.open("rb") as fh:
+        payload = pickle.load(fh)
+    if not isinstance(payload, dict) or payload.get("fingerprint") != fingerprint:
+        return None
+    dataset = payload.get("dataset")
+    return dataset if isinstance(dataset, Dataset) else None
+
+
+def _write_dataset_cache(path, dataset: Dataset, fingerprint: str) -> None:
+    with path.open("wb") as fh:
+        pickle.dump(
+            {"fingerprint": fingerprint, "dataset": dataset},
+            fh,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
 
 
 @dataclass
@@ -337,15 +373,13 @@ def prepare() -> Dataset:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     cache = DATA_DIR / "dataset.pkl"
-    if cache.exists():
-        with cache.open("rb") as fh:
-            dataset = pickle.load(fh)
-    else:
+    fingerprint = dataset_cache_fingerprint()
+    dataset = _load_dataset_cache(cache, fingerprint) if cache.exists() else None
+    if dataset is None:
         download_ml1m()
         ratings, movies = load_ml1m()
         dataset, _stats = choose_cold_ratio(ratings, movies)
-        with cache.open("wb") as fh:
-            pickle.dump(dataset, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        _write_dataset_cache(cache, dataset, fingerprint)
     stats = data_stats(dataset)
     (RESULTS_DIR / "data_stats.json").write_text(json.dumps(stats, indent=2) + "\n")
     return dataset

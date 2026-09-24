@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 
-from minigenrec.batching import collate_history, warm_ce_loss
+from minigenrec.batching import HistorySelector, collate_history, warm_ce_loss
 from minigenrec.config import (
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
@@ -20,6 +20,7 @@ from minigenrec.config import (
     COLD_RATIO_DEFAULT,
     COLD_RATIO_FALLBACK,
     COLD_SPLIT_SEED,
+    ID_DROPOUT,
     MAX_EVENTS_K,
     MAX_LEN,
     MODEL_ID,
@@ -33,7 +34,7 @@ from minigenrec.config import (
     TRAIN_SUBSET_SEED,
 )
 from minigenrec.data import prepare, sample_train_subsets
-from minigenrec.evaluation import evaluate
+from minigenrec.evaluation import evaluate, mean_hit
 from minigenrec.metrics import bootstrap_ci, user_level
 from minigenrec.model import ItemEncoder, ScoreHead
 from minigenrec.sasrec import SASRecEncoder, SASRecRanker
@@ -45,6 +46,12 @@ EPOCHS = 20
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # SASRec Mac: CPU; RunPod: CUDA
 # MPS was flaky after process kills; don't use it for long trains.
+
+
+def best_state_by_val(model, dataset, score_fn, batch_size: int = EVAL_BATCH):
+    """Return (hit, state_dict copy) for current model on warm val."""
+    hit = mean_hit(dataset, dataset.val, score_fn, batch_size)
+    return hit, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
 class FrameDataset(TorchDataset):
@@ -117,17 +124,21 @@ def base_payload(args, dataset) -> dict:
             "model_id": MODEL_ID,
             "model_revision": MODEL_REVISION,
             "top_k": TOP_K,
+            "id_dropout": ID_DROPOUT,
             "bootstrap_samples": BOOTSTRAP_SAMPLES,
             "device": DEVICE,
         },
     }
 
 
-def eval_all(dataset, score_fn) -> tuple[dict, dict]:
+def eval_all(dataset, score_fn, batch_size: int = EVAL_BATCH) -> tuple[dict, dict]:
     segments = {
-        "warm_test_full": evaluate(dataset, dataset.test, score_fn, EVAL_BATCH, warm_only=False),
-        "warm_test_warm_only": evaluate(dataset, dataset.test, score_fn, EVAL_BATCH, warm_only=True),
-        "cold_test": evaluate(dataset, dataset.cold_test, score_fn, EVAL_BATCH, warm_only=False),
+        "warm_test_full": evaluate(dataset, dataset.test, score_fn, batch_size, warm_only=False),
+        "warm_test_warm_only": evaluate(dataset, dataset.test, score_fn, batch_size, warm_only=True),
+        "cold_test": evaluate(dataset, dataset.cold_test, score_fn, batch_size, warm_only=False),
+        # Target ranked among cold items only: rewards picking the right cold
+        # movie, not boosting every cold item as a group.
+        "cold_test_cold_only": evaluate(dataset, dataset.cold_test, score_fn, batch_size, cold_only=True),
     }
     payload_segments = {}
     per_user = {}
@@ -135,6 +146,11 @@ def eval_all(dataset, score_fn) -> tuple[dict, dict]:
         summary, users = summarize_segment(frame)
         payload_segments[name] = summary
         per_user[name] = users
+    # Share of warm-test top-K slots taken by cold items; high = cold flooding.
+    warm_full = segments["warm_test_full"]
+    payload_segments["warm_test_full"]["cold_intrusion"] = (
+        float(warm_full["cold_topk"].mean()) if len(warm_full) else None
+    )
     cold = segments["cold_test"]
     by_bucket = {}
     for bucket in ("head", "mid", "tail"):
@@ -157,39 +173,67 @@ def run_popular(args, dataset, train_subset) -> None:
     write_results(payload["run_name"], payload, per_user)
 
 
-def build_sasrec(dataset, items_mode: str, seed: int, text_dim: int | None = None) -> SASRecRanker:
+def build_sasrec(
+    dataset,
+    items_mode: str,
+    seed: int,
+    text_dim: int | None = None,
+    max_events: int = MAX_EVENTS_K,
+) -> SASRecRanker:
     torch.manual_seed(seed)
     np.random.seed(seed)
     n_items = len(dataset.full_to_movie)
     cold = torch.from_numpy(dataset.cold_mask)
     item_enc = ItemEncoder(n_items, DIM, mode=items_mode, text_dim=text_dim, cold_mask=cold)
     head = ScoreHead(DIM, DIM)
-    sas = SASRecEncoder(DIM, max_len=max(MAX_EVENTS_K, 64) if False else MAX_EVENTS_K)
+    sas = SASRecEncoder(DIM, max_len=max_events)
     return SASRecRanker(item_enc, head, sas)
 
 
 def train_sasrec(args, dataset, train_subset, text_emb: torch.Tensor | None = None) -> SASRecRanker:
+    from minigenrec.llm import load_tokenizer
     text_dim = None if text_emb is None else int(text_emb.shape[1])
-    model = build_sasrec(dataset, args.items, args.model_seed, text_dim=text_dim).to(DEVICE)
+    model_max_events = MAX_LEN if args.full_history else MAX_EVENTS_K
+    model = build_sasrec(
+        dataset,
+        args.items,
+        args.model_seed,
+        text_dim=text_dim,
+        max_events=model_max_events,
+    ).to(DEVICE)
     warm_to_full = torch.from_numpy(dataset.warm_to_full).to(DEVICE)
     full_to_warm = torch.from_numpy(dataset.full_to_warm).to(DEVICE)
     text = None if text_emb is None else text_emb.to(DEVICE)
+    # Same token-budget event list as LLM (even for --items id).
+    tokenizer = load_tokenizer(MODEL_ID, MODEL_REVISION)
+    selector = HistorySelector(dataset, tokenizer, full_history=args.full_history)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     frame_ds = FrameDataset(train_subset)
 
     def collate(idxs):
         batch = train_subset.iloc[list(idxs)]
         item_ids, ratings, pad_mask, targets = collate_history(
-            dataset, batch, k=MAX_EVENTS_K, full_history=args.full_history
+            dataset,
+            batch,
+            k=MAX_EVENTS_K,
+            full_history=args.full_history,
+            selector=selector,
         )
         return item_ids, ratings, pad_mask, targets
+
+    def score_fn(batch: pd.DataFrame) -> np.ndarray:
+        return sasrec_score_fn(
+            model, dataset, batch, args.full_history, text_emb=text_emb, selector=selector
+        )
 
     loader = DataLoader(frame_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate)
     model.train()
     t0 = time.time()
+    best_hit, best_epoch, best_state = -1.0, 0, None
     for epoch in range(EPOCHS):
         total = 0.0
         n = 0
+        model.train()
         for item_ids, ratings, pad_mask, targets in loader:
             item_ids = item_ids.to(DEVICE)
             ratings = ratings.to(DEVICE)
@@ -202,7 +246,16 @@ def train_sasrec(args, dataset, train_subset, text_emb: torch.Tensor | None = No
             opt.step()
             total += float(loss.item()) * len(targets)
             n += len(targets)
-        print(f"epoch {epoch+1}/{EPOCHS} loss={total/max(n,1):.4f} ({time.time()-t0:.0f}s)")
+        hit, state = best_state_by_val(model, dataset, score_fn)
+        if hit > best_hit:
+            best_hit, best_epoch, best_state = hit, epoch + 1, state
+        print(f"epoch {epoch+1}/{EPOCHS} loss={total/max(n,1):.4f} val_hit={hit:.4f} ({time.time()-t0:.0f}s)")
+    assert best_state is not None
+    model.load_state_dict(best_state)
+    model._best_epoch = best_epoch  # type: ignore[attr-defined]
+    model._best_val_hit = best_hit  # type: ignore[attr-defined]
+    model._history_selector = selector  # type: ignore[attr-defined]
+    print(f"restored epoch={best_epoch} val_hit={best_hit:.4f}")
     return model
 
 
@@ -213,10 +266,15 @@ def sasrec_score_fn(
     batch: pd.DataFrame,
     full_history: bool,
     text_emb: torch.Tensor | None = None,
+    selector: HistorySelector | None = None,
 ) -> np.ndarray:
     model.eval()
     item_ids, ratings, pad_mask, _ = collate_history(
-        dataset, batch, k=MAX_EVENTS_K, full_history=full_history
+        dataset,
+        batch,
+        k=MAX_EVENTS_K,
+        full_history=full_history,
+        selector=selector,
     )
     text = None if text_emb is None else text_emb.to(DEVICE)
     logits = model(item_ids.to(DEVICE), ratings.to(DEVICE), pad_mask.to(DEVICE), text_emb=text)
@@ -228,18 +286,28 @@ def run_sasrec(args, dataset, train_subset) -> None:
     if args.items in ("text", "hybrid"):
         from minigenrec.text_emb import load_text_emb
 
-        text_emb = load_text_emb(dataset, title_mode=args.titles, device="cpu")
+        text_emb = load_text_emb(dataset, title_mode=args.titles)
     model = train_sasrec(args, dataset, train_subset, text_emb=text_emb)
+    selector = model._history_selector  # type: ignore[attr-defined]
     payload = base_payload(args, dataset)
     payload["titles"] = args.titles
     payload["run_name"] = args.run_name or f"sasrec_{args.items}_n{args.n_train}_seed{args.model_seed}"
-    payload["train"] = {"epochs": EPOCHS, "dim": DIM, "lr": LR, "batch_size": BATCH_SIZE}
+    payload["train"] = {
+        "epochs": EPOCHS,
+        "best_epoch": model._best_epoch,  # type: ignore[attr-defined]
+        "best_val_hit": model._best_val_hit,  # type: ignore[attr-defined]
+        "dim": DIM,
+        "lr": LR,
+        "batch_size": BATCH_SIZE,
+    }
     run_dir = RESULTS_DIR / payload["run_name"]
     run_dir.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "items": args.items, "dim": DIM}, run_dir / "model.pt")
 
     def score_fn(batch: pd.DataFrame) -> np.ndarray:
-        return sasrec_score_fn(model, dataset, batch, args.full_history, text_emb=text_emb)
+        return sasrec_score_fn(
+            model, dataset, batch, args.full_history, text_emb=text_emb, selector=selector
+        )
 
     segs, per_user = eval_all(dataset, score_fn)
     payload["segments"] = segs

@@ -1,5 +1,7 @@
 """Leakage, split, and metric contracts. Synthetic fixture, no download."""
 
+import pickle
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -12,9 +14,12 @@ from minigenrec.config import (
     DATA_DIR,
 )
 from minigenrec.data import (
+    _load_dataset_cache,
+    _write_dataset_cache,
     build_dataset,
     candidate_mask,
     choose_cold_ratio,
+    dataset_cache_fingerprint,
     load_ml1m,
     popularity_deciles,
     sample_train_subsets,
@@ -67,6 +72,23 @@ def synthetic_ratings() -> pd.DataFrame:
 
 def synthetic_dataset():
     return build_dataset(synthetic_ratings(), COLD_MOVIES, cold_ratio=0.1)
+
+
+def test_dataset_cache_requires_matching_fingerprint(tmp_path):
+    path = tmp_path / "dataset.pkl"
+    dataset = synthetic_dataset()
+    fingerprint = dataset_cache_fingerprint()
+
+    _write_dataset_cache(path, dataset, fingerprint)
+    loaded = _load_dataset_cache(path, fingerprint)
+    assert loaded is not None
+    assert loaded.full_to_movie.tolist() == dataset.full_to_movie.tolist()
+    assert _load_dataset_cache(path, "wrong-fingerprint") is None
+
+    # Legacy bare Dataset caches must be rebuilt rather than silently reused.
+    with path.open("wb") as fh:
+        pickle.dump(dataset, fh)
+    assert _load_dataset_cache(path, fingerprint) is None
 
 
 def _movies(split: pd.DataFrame, user_id: int) -> list[int]:

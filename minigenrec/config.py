@@ -28,5 +28,9 @@ MAX_LEN = 512
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
 MODEL_REVISION: str | None = "060db6499f32faf8b98477b0a26969ef7d8b9987"
 
+# Hybrid only: during training, drop each warm item's ID part with this
+# probability so text-only (cold) items are scored on the same scale.
+ID_DROPOUT = 0.5
+
 TOP_K = 10
 BOOTSTRAP_SAMPLES = 1000

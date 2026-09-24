@@ -27,11 +27,8 @@ def catalog_texts(dataset: Dataset, title_mode: str = "real") -> list[str]:
     return texts
 
 
-def load_text_emb(
-    dataset: Dataset,
-    title_mode: str = "real",
-    device: str = "cpu",
-) -> torch.Tensor:
+def load_text_emb(dataset: Dataset, title_mode: str = "real") -> torch.Tensor:
+    """CPU tensor; callers move it to their device."""
     from minigenrec.verbalize import build_title_map
 
     if title_mode == "shuffled":
@@ -42,4 +39,4 @@ def load_text_emb(
         texts = [title_map[int(mid)] for mid in dataset.full_to_movie]
     else:
         texts = catalog_texts(dataset, "real")
-    return build_or_load_text_cache(texts, title_mode, MODEL_ID, MODEL_REVISION, device=device)
+    return build_or_load_text_cache(texts, title_mode, MODEL_ID, MODEL_REVISION)

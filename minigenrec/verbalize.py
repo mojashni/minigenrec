@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -52,23 +53,9 @@ def build_prompt(event_lines: list[str]) -> str:
 
 
 def token_len(tokenizer, text: str) -> int:
-    return len(tokenizer.encode(text, add_special_tokens=False))
-
-
-def event_costs(
-    tokenizer,
-    title_map: dict[int, str],
-    movie_ids: np.ndarray,
-    modes: tuple[str, ...] = ("real", "shuffled", "none"),
-) -> np.ndarray:
-    """Per-event token cost = max across title modes (keeps history identical)."""
-    # Rebuild maps for shuffled/none once
-    # Caller should pass movie_id -> texts for each mode; here we only have one map.
-    # Use length of provided texts; for cross-mode max, caller merges.
-    return np.array(
-        [token_len(tokenizer, event_line(title_map[int(m)], 5)) for m in movie_ids],
-        dtype=np.int64,
-    )
+    # Match tokenize_prompts exactly so the marker cannot be truncated by
+    # special tokens added after the budget check.
+    return len(tokenizer.encode(text, add_special_tokens=True))
 
 
 def fit_events_to_budget(
@@ -78,19 +65,35 @@ def fit_events_to_budget(
 ) -> list[str]:
     """Drop oldest whole events until prompt + marker fits. Never split an event."""
     lines = list(event_lines)
-    while True:
-        prompt = build_prompt(lines)
-        if token_len(tokenizer, prompt) <= max_len:
-            return lines
-        if not lines:
-            return lines
-        lines = lines[1:]
+    if token_len(tokenizer, build_prompt(lines)) <= max_len:
+        return lines
+
+    # The old one-by-one loop repeatedly tokenized almost the same long prompt,
+    # making --full-history quadratic. Find the smallest dropped prefix instead.
+    lo, hi = 1, len(lines)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if token_len(tokenizer, build_prompt(lines[mid:])) <= max_len:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lines[lo:]
 
 
-def cache_key(model_id: str, revision: str | None, title_mode: str, meta_version: str = "ml1m-v1") -> str:
-    raw = f"{model_id}|{revision or 'main'}|{title_mode}|{meta_version}"
+def cache_key(
+    model_id: str,
+    revision: str | None,
+    title_mode: str,
+    texts: list[str],
+    meta_version: str = "ml1m-v3-last-nonpad-max64-cpu-fp32",
+) -> str:
+    """Fingerprint the exact ordered encoder input and encoder contract."""
+    texts_hash = hashlib.sha256(
+        json.dumps(texts, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    raw = f"{model_id}|{revision or 'main'}|{title_mode}|{meta_version}|{texts_hash}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def text_cache_path(model_id: str, revision: str | None, title_mode: str) -> Path:
-    return DATA_DIR / "cache" / f"text_{cache_key(model_id, revision, title_mode)}.pt"
+def text_cache_path(model_id: str, revision: str | None, title_mode: str, texts: list[str]) -> Path:
+    return DATA_DIR / "cache" / f"text_{cache_key(model_id, revision, title_mode, texts)}.pt"
